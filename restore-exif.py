@@ -4,12 +4,14 @@ import os
 import re
 from datetime import datetime
 from collections import Counter
-
+import subprocess
+from dotenv import load_dotenv
+import requests
 import piexif
+import time
 
 img_filename_regex = re.compile(r'IMG-\d{8}-WA\d{4}\..+')
 vid_filename_regex = re.compile(r'VID-\d{8}-WA\d{4}\..+')
-
 
 def get_datetime(filename):
     date_str = filename.split('-')[1]
@@ -50,6 +52,95 @@ def is_whatsapp_img(filename):
 def is_whatsapp_vid(filename):
     return bool(vid_filename_regex.match(filename))
 
+def refresh_asset_metadata(api, asset_id):
+    # Récupérer les variables d'environnement
+    IMMICH_SERVER_URL = os.getenv('IMMICH_SERVER_URL')
+    IMMICH_API_KEY = os.getenv(api)
+    if not IMMICH_SERVER_URL or not IMMICH_API_KEY:
+        logger.error(f'Missing IMMICH_SERVER_URL or {api}')
+        return False
+    
+    headers = {
+        "x-api-key": IMMICH_API_KEY,
+        "content-type": "application/json"
+    }
+    
+    # Endpoint pour mettre à jour un asset
+    url = f"{IMMICH_SERVER_URL}/api/assets/jobs"
+    body = {
+        "assetIds": [asset_id],
+        "name": "refresh-metadata"
+    }
+    
+    # Effectuer la requête PUT pour rafraîchir les métadonnées
+    response = requests.post(url, headers=headers, json=body)
+    if response.status_code != 204:
+        logger.warning(f'Error refreshing asset metadata: {response.text}')
+    return response.status_code == 204
+
+def get_asset_by_path(api, file_path):
+    IMMICH_SERVER_URL = os.getenv('IMMICH_SERVER_URL')
+    IMMICH_API_KEY = os.getenv(api)
+    if not IMMICH_SERVER_URL or not IMMICH_API_KEY:
+        logger.error(f'Missing IMMICH_SERVER_URL or {api}')
+        return
+    headers = {
+        "x-api-key": IMMICH_API_KEY,
+        "accept": "application/json"
+    }
+    
+    # Endpoint pour rechercher un asset par son chemin
+    url = f"{IMMICH_SERVER_URL}/api/search/metadata"
+    body = {
+        "originalFileName": file_path
+    }
+    
+    response = requests.post(url, headers=headers, json=body)
+    if response.status_code == 200:
+        json = response.json()
+        assets = json.get('assets')
+        if assets:
+            items = assets.get('items')
+            if items:
+                return items[0].get('id')
+    logger.warning(f'Error fetching asset for file: {response.text}')
+    return None
+
+def trigger_asset_refresh(path, relative_path):  
+    filename = os.path.basename(path)
+    username =  path.split(relative_path)[-1].split("/")[1]
+    username = username.upper()
+    key = f'IMMICH_API_KEY_{username}'
+    
+    assetid = get_asset_by_path(key, filename)
+    
+    if assetid is None:
+        logger.warning(f'Asset not found for file: {filename}')
+        return
+    
+    if not refresh_asset_metadata(key, assetid):
+        logger.warning(f'Error refreshing asset metadata for file: {filename}')
+        return
+
+def repair_video(filepath):
+    """
+    Tente de réparer une vidéo corrompue en utilisant ffmpeg
+    Retourne True si la réparation a réussi, False sinon
+    """
+    logger.info(f'\tTrying to repair corrupted video: {os.path.basename(filepath)}')
+    temp_file = f"{filepath}.temp.mp4"
+    repair_cmd = f'ffmpeg -i "{filepath}" -c copy "{temp_file}"'
+    
+    try:
+        subprocess.run(repair_cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.replace(temp_file, filepath)
+        logger.info(f'\tVideo repaired successfully')
+        return True
+    except Exception as e:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        logger.warning(f'\tFailed to repair video: {str(e)}')
+        return False
 
 def main(path, recursive, mod, force):
     logger.info('Validating arguments')
@@ -59,6 +150,7 @@ def main(path, recursive, mod, force):
     if not os.path.isdir(path):
         raise TypeError('Path specified is not a directory')
 
+    relative_path = path
     logger.info('Listing files in target directory')
     filepaths = get_filepaths(path, recursive)
     logger.info(f'Total files: {len(filepaths)}')
@@ -75,35 +167,72 @@ def main(path, recursive, mod, force):
     abspath_len = len(abspath) + 1
     
     counter = Counter()
-
+    
+    files_to_refresh = []
     for i, (path, filename) in enumerate(filepaths):
-        filepath = os.path.join(path, filename)
-        logger.info(
-            f'{i + 1:>{progress_digits}}/{num_files} - {filepath[abspath_len:]}')
+        
+        if i % 100 == 0:
+            logger.info(f'{i + 1:>{progress_digits}}/{num_files}')
             
+        filepath = os.path.join(path, filename)            
         if filename.endswith('.mp4') or filename.endswith('.3gp'):
             if not is_whatsapp_vid(filename):
-                logger.warning('File is not a valid WhatsApp video, skipping')
                 counter['videos_skipped'] += 1
                 continue
-            date = get_datetime(filename)
-            modTime = date.timestamp()
-            os.utime(filepath, (modTime, modTime))
-            counter['videos_modified'] += 1
 
-        elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
-            if not is_whatsapp_img(filename):
-                logger.warning('File is not a valid WhatsApp image, skipping')
-                counter['images_skipped'] += 1
+            # Vérifier si DateTimeOriginal existe déjà
+            cmd = f'exiftool -DateTimeOriginal "{filepath}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode != 0 and ("Truncated" in result.stderr or "Invalid atom size" in result.stderr):
+                if not repair_video(filepath):
+                    counter['videos_error'] += 1
+                    continue
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0 and result.stdout.strip() and not force:
+                counter['videos_skipped'] += 1
                 continue
 
             try:
+                logger.info(f'{i + 1:>{progress_digits}}/{num_files} Processing video file: {path}/{filename}')
+                date = get_datetime(filename)
+                modTime = date.timestamp()
+                
+                date_str = date.strftime("%Y:%m:%d %H:%M:%S")
+                cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                
+                # Si exiftool échoue, tenter de réparer la vidéo
+                if result.returncode != 0 and ("Truncated" in result.stderr or "Invalid atom size" in result.stderr):
+                    if repair_video(filepath):
+                        # Réessayer d'appliquer les métadonnées
+                        cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
+                        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+                    else:
+                        raise Exception("Failed to repair video")
+
+                logger.info(f'\tUpdated')
+                files_to_refresh.append(filepath)
+                counter['videos_modified'] += 1
+                
+            except Exception as e:
+                logger.warning(f'Error processing video file: {filename}')
+                counter['videos_error'] += 1
+
+        elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+            if not is_whatsapp_img(filename):
+                # logger.warning('File is not a valid WhatsApp image, skipping')
+                counter['images_skipped'] += 1
+                continue
+            
+            try:
                 exif_dict = piexif.load(filepath)
                 if exif_dict['Exif'].get(piexif.ExifIFD.DateTimeOriginal) and not force:
-                    logger.info('Exif date already exists, skipping')
+                    # logger.info('Exif date already exists, skipping')
                     counter['images_skipped'] += 1
                     continue
 
+                logger.info(f'{i + 1:>{progress_digits}}/{num_files} Processing image file: {path}/{filename}')
                 exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = get_exif_datestr(filename)
                 exif_bytes = piexif.dump(exif_dict)
                 counter['images_modified'] += 1
@@ -117,11 +246,22 @@ def main(path, recursive, mod, force):
                 counter['images_modified'] += 1
                 
             piexif.insert(exif_bytes, filepath)
-            if mod:
-                date = get_datetime(filename)
-                modTime = date.timestamp()
-                os.utime(filepath, (modTime, modTime))
 
+            files_to_refresh.append(filepath)
+            logger.info(f'\tUpdated')
+    
+    
+    if len(files_to_refresh) > 0:
+        logger.info('Waiting for 5 seconds before refreshing asset metadata')
+        time.sleep(5)
+        num_files = len(files_to_refresh)
+        progress_digits = len(str(num_files))
+        
+        for i, filepath in enumerate(files_to_refresh):
+            logger.info(f'{i + 1:>{progress_digits}}/{num_files} Refreshing asset metadata for file: {os.path.basename(filepath)}')
+            trigger_asset_refresh(filepath, relative_path)
+    
+    print('')
     logger.info('Processing summary:')
     for category, count in counter.items():
         logger.info(f'{category}: {count}')
@@ -130,6 +270,8 @@ def main(path, recursive, mod, force):
 
 
 if __name__ == "__main__":
+    load_dotenv()
+    
     parser = argparse.ArgumentParser(
         description=('Restore discarded Exif date information in WhatsApp media based on the filename. '
                      'For videos, only the created and modified dates are set.'))
