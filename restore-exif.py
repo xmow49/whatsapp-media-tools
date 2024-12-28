@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from collections import Counter
 
 import piexif
 
@@ -60,7 +61,6 @@ def main(path, recursive, mod, force):
 
     logger.info('Listing files in target directory')
     filepaths = get_filepaths(path, recursive)
-    # print(filepaths)
     logger.info(f'Total files: {len(filepaths)}')
 
     allowed_extensions = set(['.mp4', '.jpg', '.3gp', '.jpeg'])
@@ -73,43 +73,58 @@ def main(path, recursive, mod, force):
     abspath = os.path.abspath(path)
     progress_digits = len(str(num_files))
     abspath_len = len(abspath) + 1
+    
+    counter = Counter()
+
     for i, (path, filename) in enumerate(filepaths):
         filepath = os.path.join(path, filename)
         logger.info(
             f'{i + 1:>{progress_digits}}/{num_files} - {filepath[abspath_len:]}')
+            
         if filename.endswith('.mp4') or filename.endswith('.3gp'):
             if not is_whatsapp_vid(filename):
                 logger.warning('File is not a valid WhatsApp video, skipping')
+                counter['videos_skipped'] += 1
                 continue
             date = get_datetime(filename)
             modTime = date.timestamp()
             os.utime(filepath, (modTime, modTime))
+            counter['videos_modified'] += 1
 
         elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
             if not is_whatsapp_img(filename):
                 logger.warning('File is not a valid WhatsApp image, skipping')
+                counter['images_skipped'] += 1
                 continue
 
             try:
                 exif_dict = piexif.load(filepath)
                 if exif_dict['Exif'].get(piexif.ExifIFD.DateTimeOriginal) and not force:
                     logger.info('Exif date already exists, skipping')
+                    counter['images_skipped'] += 1
                     continue
 
-                exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = get_exif_datestr(
-                    filename)
+                exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = get_exif_datestr(filename)
                 exif_bytes = piexif.dump(exif_dict)
+                counter['images_modified'] += 1
             except piexif.InvalidImageDataError:
                 logger.warning(f'Invalid image data, skipping')
+                counter['images_error'] += 1
                 continue
             except ValueError:
                 logger.warning(f'Invalid exif, overwriting with new exif')
-                make_new_exif(filename)
+                exif_bytes = make_new_exif(filename)
+                counter['images_modified'] += 1
+                
             piexif.insert(exif_bytes, filepath)
             if mod:
                 date = get_datetime(filename)
                 modTime = date.timestamp()
                 os.utime(filepath, (modTime, modTime))
+
+    logger.info('Processing summary:')
+    for category, count in counter.items():
+        logger.info(f'{category}: {count}')
 
     logger.info('Finished processing files')
 
