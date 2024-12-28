@@ -1,0 +1,11 @@
+version: '3'
+services:
+  whatsapp-media-tools:
+    image: xmow/whatsapp-media-tools:latest
+    container_name: whatsapp-media-tools
+    volumes:
+      - ${MEDIA_DIR}:/media
+    environment:
+      - CRON_SCHEDULE=0 0 * * * # every day at midnight
+      - TZ=Europe/Paris
+    restart: unless-stopped
