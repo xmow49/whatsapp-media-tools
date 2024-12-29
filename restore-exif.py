@@ -2,20 +2,62 @@ import argparse
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter
 import subprocess
 from dotenv import load_dotenv
 import requests
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+import sys
+import signal
+import colorlog
 
-img_filename_regex = re.compile(r"IMG-\d{8}-WA\d{4}\..+")
+handler = colorlog.StreamHandler(stream=sys.stdout)
+handler.setFormatter(
+    colorlog.ColoredFormatter(
+        "%(log_color)s%(asctime)s %(name)-12s %(levelname)-8s%(reset)s %(message)s",
+        log_colors={
+            "DEBUG": "cyan",
+            "INFO": "green",
+            "WARNING": "yellow",
+            "ERROR": "red",
+            "CRITICAL": "red,bg_white",
+        },
+    )
+)
+
+logger = colorlog.getLogger("restore-exif")
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+img_filename_regex = re.compile(r"(IMG-\d{8}-WA\d{4}|IMG_\d{8}_\d{6}(_\d{3})?)\..+")
 vid_filename_regex = re.compile(r"VID-\d{8}-WA\d{4}\..+")
 
 
 def get_datetime(filename):
-    date_str = filename.split("-")[1]
-    return datetime.strptime(date_str, "%Y%m%d")
+    """Extract datetime from WhatsApp and Google Photos image filenames"""
+    # For WhatsApp files, only keep the part up to WAXXXX
+    if "-WA" in filename:
+        # Find the WhatsApp pattern (IMG-YYYYMMDD-WAXXXX) and ignore everything after
+        wa_match = re.search(r"(IMG-\d{8}-WA\d{4})", filename)
+        if wa_match:
+            base_filename = wa_match.group(1)
+            date_str = base_filename.split("-")[1]
+            return datetime.strptime(date_str, "%Y%m%d")
+
+    # Handle both Google Photos formats:
+    # - IMG_YYYYMMDD_HHMMSS_XXX
+    # - IMG_YYYYMMDD_HHMMSS
+    match = re.search(r"IMG_(\d{8})_(\d{6})(?:_\d{3})?", filename)
+    if match:
+        date_str = match.group(1)
+        time_str = match.group(2)
+        return datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+
+    raise ValueError(f"Unsupported filename format: {filename}")
 
 
 def get_exif_datestr(filename):
@@ -43,7 +85,8 @@ def filter_filepaths(filepaths, allowed_ext):
 
 
 def is_whatsapp_img(filename):
-    return bool(img_filename_regex.match(filename))
+    # Look for the basic WhatsApp pattern, ignore anything after
+    return bool(re.search(r"IMG-\d{8}-WA\d{4}", filename))
 
 
 def is_whatsapp_vid(filename):
@@ -144,14 +187,16 @@ def has_already_creation_date(filepath):
     Check if the file already has a creation date in its metadata
     Returns (bool, str):
         - True if date exists, False otherwise
-        - Error message if file is corrupted, None otherwise
+        - Error message if video file is corrupted, None otherwise
     """
     cmd = f'exiftool -DateTimeOriginal "{filepath}"'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    # Check if file is corrupted
-    if result.returncode != 0 and (
-        "Truncated" in result.stderr or "Invalid atom size" in result.stderr
+    # Check if video file is corrupted
+    if (
+        filepath.endswith((".mp4", ".3gp"))
+        and result.returncode != 0
+        and ("Truncated" in result.stderr or "Invalid atom size" in result.stderr)
     ):
         return False, "corrupted"
 
@@ -160,7 +205,137 @@ def has_already_creation_date(filepath):
     return has_date, None
 
 
-def main(path, recursive, mod, force, dry_run):
+def is_google_photos_img(filename):
+    """Check if filename matches Google Photos format"""
+    return bool(re.search(r"IMG_\d{8}_\d{6}(?:_\d{3})?\..+", filename))
+
+
+def get_file_type(filepath):
+    """Get the actual file type using exiftool"""
+    cmd = f'exiftool -filetype "{filepath}"'
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip().split(": ")[-1].strip()
+    return None
+
+
+def get_french_timezone_offset(date):
+    """
+    Determine if the given date is in summer time (+02:00) or winter time (+01:00) in France
+    """
+    # En France, l'heure d'été commence le dernier dimanche de mars à 2h
+    # et se termine le dernier dimanche d'octobre à 3h
+    year = date.year
+
+    # Trouver le dernier dimanche de mars
+    march_end = datetime(year, 3, 31)
+    while march_end.weekday() != 6:  # 6 = dimanche
+        march_end = march_end - timedelta(days=1)
+
+    # Trouver le dernier dimanche d'octobre
+    october_end = datetime(year, 10, 31)
+    while october_end.weekday() != 6:
+        october_end = october_end - timedelta(days=1)
+
+    # Si la date est entre ces deux dates, c'est l'heure d'été
+    if march_end <= date < october_end:
+        return "+02:00"
+    return "+01:00"
+
+
+def process_file(filepath, filename, force, dry_run, relative_path, progress_info=None):
+    """Process a single file (image or video) with all metadata operations"""
+    try:
+        if progress_info:
+            current, total = progress_info
+
+        if filename.endswith((".mp4", ".3gp")):
+            if not is_whatsapp_vid(filename):
+                return "videos_skipped", None
+
+            has_date, error = has_already_creation_date(filepath)
+            if error == "corrupted":
+                if not repair_video(filepath):
+                    return "videos_error", None
+                has_date, _ = has_already_creation_date(filepath)
+
+            if has_date and not force:
+                return "videos_skipped", None
+
+        elif filename.endswith((".jpg", ".jpeg")):
+            has_date, _ = has_already_creation_date(filepath)
+            if has_date and not force:
+                return "images_skipped", None
+
+            if not (is_whatsapp_img(filename) or is_google_photos_img(filename)):
+                logger.warning(f"Unsupported image format: {filepath}")
+                return "images_error", None
+
+        date = get_datetime(filename)
+        date_str = date.strftime("%Y:%m:%d %H:%M:%S")
+        timezone_offset = get_french_timezone_offset(date)
+
+        if dry_run:
+            logger.info(
+                f"Processing file: {filepath} - DRY RUN - Would update date to: {date_str} {timezone_offset}"
+            )
+            return "videos_modified" if filename.endswith(
+                (".mp4", ".3gp")
+            ) else "images_modified", None
+
+        # Check if it's actually a WebP file
+        actual_type = get_file_type(filepath)
+        is_webp = actual_type == "WEBP"
+
+        if is_webp:
+            cmd = (
+                f"exiv2 "
+                f'-M"set Exif.Image.DateTime {date_str}" '
+                f'-M"set Exif.Photo.DateTimeOriginal {date_str}" '
+                f'-M"set Exif.Photo.DateTimeDigitized {date_str}" '
+                f'-M"set Exif.Photo.OffsetTime {timezone_offset}" '
+                f'"{filepath}"'
+            )
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+            logger.info(
+                f"Processing WebP file: {filepath} - Updated date to: {date_str} {timezone_offset}"
+            )
+        else:
+            cmd = (
+                f"exiftool -q -m -overwrite_original "
+                f'"-DateTimeOriginal={date_str}" '
+                f'"-CreateDate={date_str}" '
+                f'"-ModifyDate={date_str}" '
+                f'"-OffsetTimeOriginal={timezone_offset}" '
+                f'"-OffsetTimeDigitized={timezone_offset}" '
+                f'"-OffsetTime={timezone_offset}" '
+                f'"{filepath}"'
+            )
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+            logger.info(
+                f"Processing file: {filepath} - Updated date to: {date_str} {timezone_offset}"
+            )
+
+        return "videos_modified" if filename.endswith(
+            (".mp4", ".3gp")
+        ) else "images_modified", filepath
+
+    except Exception as e:
+        logger.warning(f"Error processing file {filename}: {str(e)}")
+        return "videos_error" if filename.endswith(
+            (".mp4", ".3gp")
+        ) else "images_error", None
+
+
+def signal_handler(signum, frame):
+    logger.info("\nInterrupt received, stopping gracefully...")
+    sys.exit(0)
+
+
+def main(path, recursive, mod, force, dry_run, threads):
+    # Set up signal handler for graceful interruption
+    signal.signal(signal.SIGINT, signal_handler)
+
     logger.info("Validating arguments")
     if not os.path.exists(path):
         raise FileNotFoundError("Path specified does not exist")
@@ -174,121 +349,55 @@ def main(path, recursive, mod, force, dry_run):
     relative_path = path
     logger.info("Listing files in target directory")
     filepaths = get_filepaths(path, recursive)
-    logger.info(f"Total files: {len(filepaths)}")
-
-    allowed_extensions = set([".mp4", ".jpg", ".3gp", ".jpeg"])
-    logger.info(f"Filtering for valid file extensions: {allowed_extensions}")
-    filepaths = filter_filepaths(filepaths, allowed_ext=allowed_extensions)
+    filepaths = filter_filepaths(
+        filepaths, allowed_ext={".mp4", ".jpg", ".3gp", ".jpeg"}
+    )
     num_files = len(filepaths)
-    logger.info(f"Valid files: {num_files}")
 
-    logger.info("Begin processing files")
-    abspath = os.path.abspath(path)
-    progress_digits = len(str(num_files))
-    abspath_len = len(abspath) + 1
+    num_threads = threads if threads else min(os.cpu_count() * 2, 8)
+    logger.info(f"Processing {num_files} files using {num_threads} threads")
 
     counter = Counter()
-
     files_to_refresh = []
-    for i, (path, filename) in enumerate(filepaths):
-        if i % 100 == 0:
-            logger.info(f"{i + 1:>{progress_digits}}/{num_files}")
+    processed_count = 0
 
-        filepath = os.path.join(path, filename)
-        if filename.endswith(".mp4") or filename.endswith(".3gp"):
-            if not is_whatsapp_vid(filename):
-                counter["videos_skipped"] += 1
-                continue
+    process_func = partial(
+        process_file, force=force, dry_run=dry_run, relative_path=relative_path
+    )
 
-            # Check if the video has existing metadata
-            has_date, error = has_already_creation_date(filepath)
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        future_to_file = {
+            executor.submit(
+                process_func,
+                os.path.join(path, filename),
+                filename,
+                progress_info=(i + 1, num_files),
+            ): (path, filename)
+            for i, (path, filename) in enumerate(filepaths)
+        }
 
-            if error == "corrupted":
-                if not repair_video(filepath):
-                    counter["videos_error"] += 1
-                    continue
-                has_date, _ = has_already_creation_date(filepath)
-
-            if has_date and not force:
-                counter["videos_skipped"] += 1
-                continue
-
+        for future in as_completed(future_to_file):
+            path, filename = future_to_file[future]
             try:
-                logger.info(
-                    f"{i + 1:>{progress_digits}}/{num_files} Processing video file: {path}/{filename}"
-                )
-                date = get_datetime(filename)
-                modTime = date.timestamp()
+                result_type, filepath = future.result()
+                counter[result_type] += 1
+                processed_count += 1
 
-                date_str = date.strftime("%Y:%m:%d %H:%M:%S")
-                cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
+                if filepath:
+                    files_to_refresh.append(filepath)
 
-                if dry_run:
-                    logger.info(f"\tWould update video date to: {date_str}")
-                    counter["videos_modified"] += 1
-                    continue
-
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
-                # if the video is corrupted, try to repair it
-                if result.returncode != 0 and (
-                    "Truncated" in result.stderr or "Invalid atom size" in result.stderr
-                ):
-                    if repair_video(filepath):
-                        # Réessayer d'appliquer les métadonnées
-                        cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
-                        subprocess.run(
-                            cmd, shell=True, check=True, stdout=subprocess.DEVNULL
-                        )
-                    else:
-                        raise Exception("Failed to repair video")
-
-                logger.info(f"\tUpdated")
-                files_to_refresh.append(filepath)
-                counter["videos_modified"] += 1
+                # Ajouter un log tous les 100 fichiers
+                if processed_count % 100 == 0:
+                    logger.info(
+                        f"Processed {processed_count}/{num_files} files. Current counts: {dict(counter)}"
+                    )
 
             except Exception as e:
-                logger.warning(f"Error processing video file: {filename}")
-                counter["videos_error"] += 1
+                logger.error(f"Error processing {filename}: {str(e)}")
+                counter["error"] += 1
+                processed_count += 1
 
-        elif filename.endswith(".jpg") or filename.endswith(".jpeg"):
-            # Check if the image has existing metadata
-            has_date, error = has_already_creation_date(filepath)
-            if has_date and not force:
-                counter["images_skipped"] += 1
-                continue
-
-            if not is_whatsapp_img(filename):
-                logger.warning(f"Non-whatsapp image without exif: {path}/{filename}")
-                counter["images_skipped"] += 1
-                continue
-
-            try:
-                logger.info(
-                    f"{i + 1:>{progress_digits}}/{num_files} Processing image file: {path}/{filename}"
-                )
-
-                date = get_datetime(filename)
-                date_str = date.strftime("%Y:%m:%d %H:%M:%S")
-                cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
-
-                if dry_run:
-                    logger.info(f"\tWould update image date to: {date_str}")
-                    counter["images_modified"] += 1
-                    continue
-
-                subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
-
-                files_to_refresh.append(filepath)
-                counter["images_modified"] += 1
-                logger.info(f"\tUpdated")
-
-            except Exception as e:
-                logger.warning(f"Error processing image file: {filename}")
-                counter["images_error"] += 1
-                continue
-
-    if len(files_to_refresh) > 1000 and not dry_run:
+    if len(files_to_refresh) > 0 and not dry_run:
         logger.info("Waiting for 5 seconds before refreshing asset metadata")
         time.sleep(5)
         num_files = len(files_to_refresh)
@@ -309,6 +418,9 @@ def main(path, recursive, mod, force, dry_run):
 
 
 if __name__ == "__main__":
+    # Set up signal handler at program start
+    signal.signal(signal.SIGINT, signal_handler)
+
     load_dotenv()
 
     parser = argparse.ArgumentParser(
@@ -345,12 +457,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Show what would be done without actually modifying files",
     )
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s"
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=None,
+        help="Number of threads to use for processing (default: min(CPU_COUNT * 2, 8))",
     )
-    logger = logging.getLogger("restore-exif")
+    args = parser.parse_args()
 
     main(
         args.path,
@@ -358,4 +472,5 @@ if __name__ == "__main__":
         mod=args.mod,
         force=args.force,
         dry_run=args.dry_run,
+        threads=args.threads,
     )
