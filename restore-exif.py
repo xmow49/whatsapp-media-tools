@@ -7,7 +7,6 @@ from collections import Counter
 import subprocess
 from dotenv import load_dotenv
 import requests
-import piexif
 import time
 
 img_filename_regex = re.compile(r"IMG-\d{8}-WA\d{4}\..+")
@@ -41,11 +40,6 @@ def get_filepaths(path, recursive):
 
 def filter_filepaths(filepaths, allowed_ext):
     return [(fp, fn) for fp, fn in filepaths if os.path.splitext(fn)[-1] in allowed_ext]
-
-
-def make_new_exif(filename):
-    exif_dict = {"Exif": {piexif.ExifIFD.DateTimeOriginal: get_exif_datestr(filename)}}
-    return piexif.dump(exif_dict)
 
 
 def is_whatsapp_img(filename):
@@ -166,13 +160,16 @@ def has_already_creation_date(filepath):
     return has_date, None
 
 
-def main(path, recursive, mod, force):
+def main(path, recursive, mod, force, dry_run):
     logger.info("Validating arguments")
     if not os.path.exists(path):
         raise FileNotFoundError("Path specified does not exist")
 
     if not os.path.isdir(path):
         raise TypeError("Path specified is not a directory")
+
+    if dry_run:
+        logger.info("DRY RUN MODE - No files will be modified")
 
     relative_path = path
     logger.info("Listing files in target directory")
@@ -225,6 +222,12 @@ def main(path, recursive, mod, force):
 
                 date_str = date.strftime("%Y:%m:%d %H:%M:%S")
                 cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
+
+                if dry_run:
+                    logger.info(f"\tWould update video date to: {date_str}")
+                    counter["videos_modified"] += 1
+                    continue
+
                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
                 # if the video is corrupted, try to repair it
@@ -249,41 +252,43 @@ def main(path, recursive, mod, force):
                 counter["videos_error"] += 1
 
         elif filename.endswith(".jpg") or filename.endswith(".jpeg"):
+            # Check if the image has existing metadata
+            has_date, error = has_already_creation_date(filepath)
+            if has_date and not force:
+                counter["images_skipped"] += 1
+                continue
+
             if not is_whatsapp_img(filename):
-                # logger.warning('File is not a valid WhatsApp image, skipping')
+                logger.warning(f"Non-whatsapp image without exif: {path}/{filename}")
                 counter["images_skipped"] += 1
                 continue
 
             try:
-                exif_dict = piexif.load(filepath)
-                if exif_dict["Exif"].get(piexif.ExifIFD.DateTimeOriginal) and not force:
-                    # logger.info('Exif date already exists, skipping')
-                    counter["images_skipped"] += 1
-                    continue
-
                 logger.info(
                     f"{i + 1:>{progress_digits}}/{num_files} Processing image file: {path}/{filename}"
                 )
-                exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = get_exif_datestr(
-                    filename
-                )
-                exif_bytes = piexif.dump(exif_dict)
+
+                date = get_datetime(filename)
+                date_str = date.strftime("%Y:%m:%d %H:%M:%S")
+                cmd = f'exiftool -q -m -overwrite_original "-AllDates={date_str}" "{filepath}"'
+
+                if dry_run:
+                    logger.info(f"\tWould update image date to: {date_str}")
+                    counter["images_modified"] += 1
+                    continue
+
+                subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+
+                files_to_refresh.append(filepath)
                 counter["images_modified"] += 1
-            except piexif.InvalidImageDataError:
-                logger.warning(f"Invalid image data, skipping")
+                logger.info(f"\tUpdated")
+
+            except Exception as e:
+                logger.warning(f"Error processing image file: {filename}")
                 counter["images_error"] += 1
                 continue
-            except ValueError:
-                logger.warning(f"Invalid exif, overwriting with new exif")
-                exif_bytes = make_new_exif(filename)
-                counter["images_modified"] += 1
 
-            piexif.insert(exif_bytes, filepath)
-
-            files_to_refresh.append(filepath)
-            logger.info(f"\tUpdated")
-
-    if len(files_to_refresh) > 0:
+    if len(files_to_refresh) > 1000 and not dry_run:
         logger.info("Waiting for 5 seconds before refreshing asset metadata")
         time.sleep(5)
         num_files = len(files_to_refresh)
@@ -334,6 +339,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Overwrite existing exif date",
     )
+    parser.add_argument(
+        "--dry-run",
+        default=False,
+        action="store_true",
+        help="Show what would be done without actually modifying files",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -341,4 +352,10 @@ if __name__ == "__main__":
     )
     logger = logging.getLogger("restore-exif")
 
-    main(args.path, recursive=args.recursive, mod=args.mod, force=args.force)
+    main(
+        args.path,
+        recursive=args.recursive,
+        mod=args.mod,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
