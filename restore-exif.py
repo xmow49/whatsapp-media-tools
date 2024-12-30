@@ -14,6 +14,8 @@ import sys
 import signal
 import colorlog
 
+executor = None  # Global ThreadPoolExecutor reference
+
 handler = colorlog.StreamHandler(stream=sys.stdout)
 handler.setFormatter(
     colorlog.ColoredFormatter(
@@ -249,25 +251,22 @@ def has_already_creation_date(filepath):
         - True if any of DateTimeOriginal, MediaCreateDate, or CreateDate exists
         - Error message if video file is corrupted, None otherwise
     """
-    ext = normalize_extension(os.path.splitext(filepath)[1])
 
-    if ext in {".mp4", ".3gp"}:
-        # Check for any of the three date fields
-        cmd = f'exiftool -DateTimeOriginal -MediaCreateDate -CreateDate "{filepath}"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Check for any of the three date fields
+    cmd = f'exiftool -DateTimeOriginal -MediaCreateDate -CreateDate "{filepath}"'
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-        # Check if video file is corrupted
-        if result.returncode != 0 and (
-            "Truncated" in result.stderr or "Invalid atom size" in result.stderr
-        ):
-            return False, "corrupted"
+    # Check if video file is corrupted
+    if result.returncode != 0 and (
+        "Truncated" in result.stderr or "Invalid atom size" in result.stderr
+    ):
+        return False, "corrupted"
 
-        return result.returncode == 0 and bool(result.stdout.strip()), None
-    else:
-        # Use exiv2 for images
-        cmd = f'exiv2 -pt "{filepath}" | grep "Exif.Photo.DateTimeOriginal"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return result.returncode == 0 and bool(result.stdout.strip()), None
+    if result.returncode != 0:
+        logger.warning(f"Error fetching asset for file: {filepath}: {result}")
+        return False, None
+
+    return bool(result.stdout.strip()), None
 
 
 def is_google_photos_img(filename):
@@ -306,6 +305,9 @@ def has_timezone(filepath):
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+want_stop = False
+
+
 def process_file(filepath, filename, force, dry_run, relative_path, progress_info=None):
     """Process a single file (image or video) with all metadata operations"""
     try:
@@ -316,17 +318,19 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
             if error == "corrupted":
                 if dry_run:
                     logger.info(f"Would repair video: {filepath}")
+                    with open("dry-run.txt", "a") as f:
+                        f.write(f"{filepath}\n")
                     return "videos_modified", filepath
                 if not repair_video(filepath):
                     return "videos_error", None
                 has_date, _ = has_already_creation_date(filepath)
 
-            if has_date and not force:
+            if has_date:
                 return "videos_skipped", None
 
         elif ext in PHOTO_EXTENSIONS:
             has_date, _ = has_already_creation_date(filepath)
-            if has_date and not force:
+            if has_date:
                 return "images_skipped", None
 
         else:
@@ -341,6 +345,8 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
             logger.info(
                 f"Processing file: {filepath} - DRY RUN - Would update date to: {date_str} {timezone_offset if is_whatsapp_img(filename) else ''}"
             )
+            with open("dry-run.txt", "a") as f:
+                f.write(f"{filepath}\n")
             return (
                 "videos_modified" if ext in VIDEO_EXTENSIONS else "images_modified",
                 None,
@@ -384,11 +390,17 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
 
 
 def signal_handler(signum, frame):
+    global want_stop
     logger.info("\nInterrupt received, stopping gracefully...")
-    sys.exit(0)
+    want_stop = True
+    if executor:
+        logger.info("Shutting down thread pool...")
+        executor.shutdown(wait=False, cancel_futures=True)  # Python 3.9+ only
+    # sys.exit(0)
 
 
 def main(path, recursive, mod, force, dry_run, threads):
+    global executor  # Use the global executor
     # Set up signal handler for graceful interruption
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -399,7 +411,10 @@ def main(path, recursive, mod, force, dry_run, threads):
     if not os.path.isdir(path):
         raise TypeError("Path specified is not a directory")
 
+    # Reset dry-run.txt file if in dry-run mode
     if dry_run:
+        with open("dry-run.txt", "w") as f:
+            f.write("")  # Clear file contents
         logger.info("DRY RUN MODE - No files will be modified")
 
     relative_path = path
@@ -419,73 +434,83 @@ def main(path, recursive, mod, force, dry_run, threads):
         process_file, force=force, dry_run=dry_run, relative_path=relative_path
     )
 
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        future_to_file = {
-            executor.submit(
-                process_func,
-                os.path.join(path, filename),
-                filename,
-                progress_info=(i + 1, num_files),
-            ): (path, filename)
-            for i, (path, filename) in enumerate(filepaths)
-        }
-
-        for future in as_completed(future_to_file):
-            path, filename = future_to_file[future]
-            try:
-                result_type, filepath = future.result()
-                counter[result_type] += 1
-                processed_count += 1
-
-                if filepath:
-                    files_to_refresh.append(filepath)
-
-                # Ajouter un log tous les 100 fichiers
-                if processed_count % 100 == 0:
-                    logger.info(
-                        f"Processed {processed_count}/{num_files} files. Current counts: {dict(counter)}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Error processing {filename}: {str(e)}")
-                counter["error"] += 1
-                processed_count += 1
-
-    if len(files_to_refresh) > 0 and not dry_run:
-        logger.info("Waiting for 5 seconds before refreshing asset metadata")
-        time.sleep(5)
-        num_files = len(files_to_refresh)
-        progress_digits = len(str(num_files))
-        processed_count = 0
-
-        # Utiliser ThreadPoolExecutor pour le rafraîchissement des métadonnées
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+    with ThreadPoolExecutor(max_workers=num_threads) as exec:
+        executor = exec  # Store reference to executor globally
+        try:
             future_to_file = {
                 executor.submit(
-                    trigger_asset_refresh, filepath, relative_path
-                ): filepath
-                for filepath in files_to_refresh
+                    process_func,
+                    os.path.join(path, filename),
+                    filename,
+                    progress_info=(i + 1, num_files),
+                ): (path, filename)
+                for i, (path, filename) in enumerate(filepaths)
             }
 
             for future in as_completed(future_to_file):
-                filepath = future_to_file[future]
-                processed_count += 1
+                if want_stop:
+                    break
+                path, filename = future_to_file[future]
                 try:
-                    future.result()
-                    logger.info(
-                        f"{processed_count:>{progress_digits}}/{num_files} Refreshed asset metadata for file: {os.path.basename(filepath)}"
-                    )
+                    result_type, filepath = future.result()
+                    counter[result_type] += 1
+                    processed_count += 1
+
+                    if filepath:
+                        files_to_refresh.append(filepath)
+
+                    # Ajouter un log tous les 100 fichiers
+                    if processed_count % 100 == 0:
+                        logger.info(
+                            f"Processed {processed_count}/{num_files} files. Current counts: {dict(counter)}"
+                        )
+
                 except Exception as e:
-                    logger.error(
-                        f"Error refreshing metadata for {os.path.basename(filepath)}: {str(e)}"
-                    )
+                    logger.error(f"Error processing {filename}: {str(e)}")
+                    counter["error"] += 1
+                    processed_count += 1
 
-    print("")
-    logger.info("Processing summary:")
-    for category, count in counter.items():
-        logger.info(f"{category}: {count}")
+            if want_stop:
+                exit()
 
-    logger.info("Finished processing files")
+            if len(files_to_refresh) > 0 and not dry_run:
+                logger.info("Waiting for 5 seconds before refreshing asset metadata")
+                time.sleep(5)
+                num_files = len(files_to_refresh)
+                progress_digits = len(str(num_files))
+                processed_count = 0
+
+                # Utiliser ThreadPoolExecutor pour le rafraîchissement des métadonnées
+                with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    future_to_file = {
+                        executor.submit(
+                            trigger_asset_refresh, filepath, relative_path
+                        ): filepath
+                        for filepath in files_to_refresh
+                    }
+
+                    for future in as_completed(future_to_file):
+                        filepath = future_to_file[future]
+                        processed_count += 1
+                        try:
+                            future.result()
+                            logger.info(
+                                f"{processed_count:>{progress_digits}}/{num_files} Refreshed asset metadata for file: {os.path.basename(filepath)}"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Error refreshing metadata for {os.path.basename(filepath)}: {str(e)}"
+                            )
+
+            print("")
+            logger.info("Processing summary:")
+            for category, count in counter.items():
+                logger.info(f"{category}: {count}")
+
+            logger.info("Finished processing files")
+
+        finally:
+            executor = None  # Clear the global reference
 
 
 if __name__ == "__main__":
@@ -536,6 +561,16 @@ if __name__ == "__main__":
         help="Number of threads to use for processing (default: min(CPU_COUNT * 2, 8))",
     )
     args = parser.parse_args()
+
+    # print(has_already_creation_date("/media/dorian/2020/12/IMG_20201209_111448_1.jpg"))
+    # process_file(
+    #     "/media/dorian/2020/12/IMG_20201209_111448_1.jpg",
+    #     "IMG_20201209_111448_1.jpg",
+    #     False,
+    #     True,
+    #     "/media",
+    # )
+    # exit()
 
     main(
         args.path,

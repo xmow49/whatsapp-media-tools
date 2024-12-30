@@ -8,15 +8,16 @@ RUN apt-get update && apt-get install -y \
     cron \
     libimage-exiftool-perl \
     ffmpeg \
+    exiv2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY restore-exif.py .
 COPY requirements.txt .
-
 RUN pip install -r requirements.txt
 
 COPY entrypoint.sh entrypoint.sh
+
+COPY restore-exif.py .
 RUN chmod +x entrypoint.sh
 
 ENTRYPOINT ["./entrypoint.sh"]
