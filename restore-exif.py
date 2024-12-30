@@ -243,6 +243,15 @@ def get_french_timezone_offset(date):
     return "+01:00"
 
 
+def has_timezone(filepath):
+    """Check if the file already has timezone information in its metadata"""
+    cmd = f'exiftool -OffsetTime -OffsetTimeOriginal -OffsetTimeDigitized "{filepath}"'
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return result.returncode == 0 and any(
+        line.split(": ")[1].strip() for line in result.stdout.splitlines()
+    )
+
+
 def process_file(filepath, filename, force, dry_run, relative_path, progress_info=None):
     """Process a single file (image or video) with all metadata operations"""
     try:
@@ -264,7 +273,14 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
 
         elif filename.endswith((".jpg", ".jpeg")):
             has_date, _ = has_already_creation_date(filepath)
-            if has_date and not force:
+            has_tz = has_timezone(filepath)
+
+            # Skip non-WhatsApp images if they have date
+            if not is_whatsapp_img(filename) and has_date:
+                return "images_skipped", None
+
+            # Skip WhatsApp images if they have both date and timezone
+            if is_whatsapp_img(filename) and has_date and has_tz and not force:
                 return "images_skipped", None
 
             if not (is_whatsapp_img(filename) or is_google_photos_img(filename)):
@@ -277,7 +293,7 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
 
         if dry_run:
             logger.info(
-                f"Processing file: {filepath} - DRY RUN - Would update date to: {date_str} {timezone_offset}"
+                f"Processing file: {filepath} - DRY RUN - Would update date to: {date_str} {timezone_offset if is_whatsapp_img(filename) else ''}"
             )
             return "videos_modified" if filename.endswith(
                 (".mp4", ".3gp")
@@ -288,33 +304,37 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
         is_webp = actual_type == "WEBP"
 
         if is_webp:
-            cmd = (
-                f"exiv2 "
+            base_cmd = (
                 f'-M"set Exif.Image.DateTime {date_str}" '
                 f'-M"set Exif.Photo.DateTimeOriginal {date_str}" '
                 f'-M"set Exif.Photo.DateTimeDigitized {date_str}" '
-                f'-M"set Exif.Photo.OffsetTime {timezone_offset}" '
-                f'"{filepath}"'
             )
-            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
-            logger.info(
-                f"Processing WebP file: {filepath} - Updated date to: {date_str} {timezone_offset}"
-            )
+
+            if is_whatsapp_img(filename):
+                base_cmd += f'-M"set Exif.Photo.OffsetTime {timezone_offset}" '
+
+            cmd = f'exiv2 {base_cmd} "{filepath}"'
+
         else:
-            cmd = (
-                f"exiftool -q -m -overwrite_original "
+            base_cmd = (
                 f'"-DateTimeOriginal={date_str}" '
                 f'"-CreateDate={date_str}" '
                 f'"-ModifyDate={date_str}" '
-                f'"-OffsetTimeOriginal={timezone_offset}" '
-                f'"-OffsetTimeDigitized={timezone_offset}" '
-                f'"-OffsetTime={timezone_offset}" '
-                f'"{filepath}"'
             )
-            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
-            logger.info(
-                f"Processing file: {filepath} - Updated date to: {date_str} {timezone_offset}"
-            )
+
+            if is_whatsapp_img(filename):
+                base_cmd += (
+                    f'"-OffsetTimeOriginal={timezone_offset}" '
+                    f'"-OffsetTimeDigitized={timezone_offset}" '
+                    f'"-OffsetTime={timezone_offset}" '
+                )
+
+            cmd = f'exiftool -q -m -overwrite_original {base_cmd} "{filepath}"'
+
+        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+        logger.info(
+            f"Processing file: {filepath} - Updated date to: {date_str} {timezone_offset if is_whatsapp_img(filename) else ''}"
+        )
 
         return "videos_modified" if filename.endswith(
             (".mp4", ".3gp")
