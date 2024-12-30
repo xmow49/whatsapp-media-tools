@@ -33,29 +33,80 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 
+def normalize_extension(ext):
+    """Normalize file extension to lowercase and ensure it starts with a dot"""
+    if not ext.startswith("."):
+        ext = "." + ext
+    return ext.lower()
+
+
+def create_extensions_set(*extensions):
+    """Create a set of extensions"""
+    return {ext if ext.startswith(".") else "." + ext for ext in extensions}
+
+
+PHOTO_EXTENSIONS = create_extensions_set("jpg", "jpeg", "png", "gif", "webp")
+VIDEO_EXTENSIONS = create_extensions_set(
+    "mp4", "3gp", "mov", "avi", "mkv", "flv", "wmv", "webm"
+)
+
+SUPPORTED_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
+
 img_filename_regex = re.compile(r"(IMG-\d{8}-WA\d{4}|IMG_\d{8}_\d{6}(_\d{3})?)\..+")
 vid_filename_regex = re.compile(r"VID-\d{8}-WA\d{4}\..+")
 
 
 def get_datetime(filename):
-    """Extract datetime from WhatsApp and Google Photos image filenames"""
-    # For WhatsApp files, only keep the part up to WAXXXX
-    if "-WA" in filename:
-        # Find the WhatsApp pattern (IMG-YYYYMMDD-WAXXXX) and ignore everything after
-        wa_match = re.search(r"(IMG-\d{8}-WA\d{4})", filename)
-        if wa_match:
-            base_filename = wa_match.group(1)
-            date_str = base_filename.split("-")[1]
-            return datetime.strptime(date_str, "%Y%m%d")
+    """Extract datetime from various image filename formats"""
+    # Liste des patterns connus avec leurs formats de date associés
+    patterns = [
+        # Format WhatsApp: IMG-YYYYMMDD-WAXXXX
+        (r"IMG-(\d{8})-WA\d{4}", "%Y%m%d"),
+        # Format Google Photos: IMG_YYYYMMDD_HHMMSS(_XXX)
+        (r"IMG_(\d{8})_(\d{6})(?:_\d{3})?", "%Y%m%d%H%M%S", 2),
+        # Format mms: mms_YYYYMMDD_HHMMSS
+        (r"mms_(\d{8})_(\d{6})", "%Y%m%d%H%M%S", 2),
+        # Format Resized avec date: Resized_YYYYMMDD_HHMMSS
+        (r"Resized_(\d{8})_(\d{6})", "%Y%m%d%H%M%S", 2),
+        # Format Screenshot: Screenshot_YYYYMMDD-HHMMSS
+        (r"Screenshot_(\d{8})-(\d{6})", "%Y%m%d%H%M%S", 2),
+        # Format ClumsyNinja: ClumsyNinja_DDMMYYYY_HHMMSS
+        (r"ClumsyNinja_(\d{8})_(\d{6})", "%d%m%Y%H%M%S", 2),
+        # Format Screenshot with dash: Screenshot_YYYY-MM-DD-HH-MM-SS
+        (r"Screenshot_(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})", "%Y-%m-%d-%H-%M-%S"),
+    ]
 
-    # Handle both Google Photos formats:
-    # - IMG_YYYYMMDD_HHMMSS_XXX
-    # - IMG_YYYYMMDD_HHMMSS
-    match = re.search(r"IMG_(\d{8})_(\d{6})(?:_\d{3})?", filename)
+    base_filename = os.path.splitext(filename)[0]
+
+    for pattern, date_format, *groups in patterns:
+        match = re.search(pattern, base_filename)
+        if match:
+            if len(groups) > 0 and groups[0] == 2:
+                # Format avec date ET heure
+                date_str = match.group(1)
+                time_str = match.group(2)
+                datetime_str = f"{date_str}{time_str}"
+            else:
+                # Format avec date uniquement
+                datetime_str = match.group(1)
+                if len(datetime_str) == 8:  # YYYYMMDD
+                    datetime_str += "000000"  # Ajouter 00:00:00 comme heure par défaut
+
+            try:
+                return datetime.strptime(datetime_str, date_format)
+            except ValueError:
+                continue
+
+    # Si aucun pattern ne correspond, chercher une date générique dans le nom
+    generic_date_pattern = r"(\d{8})[_-]?(\d{6})?"
+    match = re.search(generic_date_pattern, base_filename)
     if match:
         date_str = match.group(1)
-        time_str = match.group(2)
-        return datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+        time_str = match.group(2) if match.group(2) else "000000"
+        try:
+            return datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
 
     raise ValueError(f"Unsupported filename format: {filename}")
 
@@ -81,7 +132,12 @@ def get_filepaths(path, recursive):
 
 
 def filter_filepaths(filepaths, allowed_ext):
-    return [(fp, fn) for fp, fn in filepaths if os.path.splitext(fn)[-1] in allowed_ext]
+    """Filter filepaths based on their extensions (case insensitive)"""
+    return [
+        (fp, fn)
+        for fp, fn in filepaths
+        if normalize_extension(os.path.splitext(fn)[-1]) in allowed_ext
+    ]
 
 
 def is_whatsapp_img(filename):
@@ -160,6 +216,10 @@ def repair_video(filepath):
     Tente de réparer une vidéo corrompue en utilisant ffmpeg
     Retourne True si la réparation a réussi, False sinon
     """
+    ext = normalize_extension(os.path.splitext(filepath)[1])
+    if ext not in VIDEO_EXTENSIONS:
+        return False
+
     logger.info(f"\tTrying to repair corrupted video: {os.path.basename(filepath)}")
     temp_file = f"{filepath}.temp.mp4"
     repair_cmd = f'ffmpeg -i "{filepath}" -c copy "{temp_file}"'
@@ -186,37 +246,33 @@ def has_already_creation_date(filepath):
     """
     Check if the file already has a creation date in its metadata
     Returns (bool, str):
-        - True if date exists, False otherwise
+        - True if any of DateTimeOriginal, MediaCreateDate, or CreateDate exists
         - Error message if video file is corrupted, None otherwise
     """
-    cmd = f'exiftool -DateTimeOriginal "{filepath}"'
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    ext = normalize_extension(os.path.splitext(filepath)[1])
 
-    # Check if video file is corrupted
-    if (
-        filepath.endswith((".mp4", ".3gp"))
-        and result.returncode != 0
-        and ("Truncated" in result.stderr or "Invalid atom size" in result.stderr)
-    ):
-        return False, "corrupted"
+    if ext in {".mp4", ".3gp"}:
+        # Check for any of the three date fields
+        cmd = f'exiftool -DateTimeOriginal -MediaCreateDate -CreateDate "{filepath}"'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    # Check if date exists
-    has_date = result.returncode == 0 and bool(result.stdout.strip())
-    return has_date, None
+        # Check if video file is corrupted
+        if result.returncode != 0 and (
+            "Truncated" in result.stderr or "Invalid atom size" in result.stderr
+        ):
+            return False, "corrupted"
+
+        return result.returncode == 0 and bool(result.stdout.strip()), None
+    else:
+        # Use exiv2 for images
+        cmd = f'exiv2 -pt "{filepath}" | grep "Exif.Photo.DateTimeOriginal"'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return result.returncode == 0 and bool(result.stdout.strip()), None
 
 
 def is_google_photos_img(filename):
     """Check if filename matches Google Photos format"""
     return bool(re.search(r"IMG_\d{8}_\d{6}(?:_\d{3})?\..+", filename))
-
-
-def get_file_type(filepath):
-    """Get the actual file type using exiftool"""
-    cmd = f'exiftool -filetype "{filepath}"'
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip().split(": ")[-1].strip()
-    return None
 
 
 def get_french_timezone_offset(date):
@@ -245,25 +301,22 @@ def get_french_timezone_offset(date):
 
 def has_timezone(filepath):
     """Check if the file already has timezone information in its metadata"""
-    cmd = f'exiftool -OffsetTime -OffsetTimeOriginal -OffsetTimeDigitized "{filepath}"'
+    cmd = f'exiv2 -pt "{filepath}" | grep "Exif.Photo.OffsetTime"'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    return result.returncode == 0 and any(
-        line.split(": ")[1].strip() for line in result.stdout.splitlines()
-    )
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def process_file(filepath, filename, force, dry_run, relative_path, progress_info=None):
     """Process a single file (image or video) with all metadata operations"""
     try:
-        if progress_info:
-            current, total = progress_info
+        ext = normalize_extension(os.path.splitext(filename)[1])
 
-        if filename.endswith((".mp4", ".3gp")):
-            if not is_whatsapp_vid(filename):
-                return "videos_skipped", None
-
+        if ext in VIDEO_EXTENSIONS:
             has_date, error = has_already_creation_date(filepath)
             if error == "corrupted":
+                if dry_run:
+                    logger.info(f"Would repair video: {filepath}")
+                    return "videos_modified", filepath
                 if not repair_video(filepath):
                     return "videos_error", None
                 has_date, _ = has_already_creation_date(filepath)
@@ -271,21 +324,14 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
             if has_date and not force:
                 return "videos_skipped", None
 
-        elif filename.endswith((".jpg", ".jpeg")):
+        elif ext in PHOTO_EXTENSIONS:
             has_date, _ = has_already_creation_date(filepath)
-            has_tz = has_timezone(filepath)
-
-            # Skip non-WhatsApp images if they have date
-            if not is_whatsapp_img(filename) and has_date:
+            if has_date and not force:
                 return "images_skipped", None
 
-            # Skip WhatsApp images if they have both date and timezone
-            if is_whatsapp_img(filename) and has_date and has_tz and not force:
-                return "images_skipped", None
-
-            if not (is_whatsapp_img(filename) or is_google_photos_img(filename)):
-                logger.warning(f"Unsupported image format: {filepath}")
-                return "images_error", None
+        else:
+            logger.warning(f"Unsupported file extension: {ext}")
+            return "unsupported_extension", None
 
         date = get_datetime(filename)
         date_str = date.strftime("%Y:%m:%d %H:%M:%S")
@@ -295,56 +341,46 @@ def process_file(filepath, filename, force, dry_run, relative_path, progress_inf
             logger.info(
                 f"Processing file: {filepath} - DRY RUN - Would update date to: {date_str} {timezone_offset if is_whatsapp_img(filename) else ''}"
             )
-            return "videos_modified" if filename.endswith(
-                (".mp4", ".3gp")
-            ) else "images_modified", None
+            return (
+                "videos_modified" if ext in VIDEO_EXTENSIONS else "images_modified",
+                None,
+            )
 
-        # Check if it's actually a WebP file
-        actual_type = get_file_type(filepath)
-        is_webp = actual_type == "WEBP"
-
-        if is_webp:
+        if ext in VIDEO_EXTENSIONS:
+            # Keep using exiftool for videos
+            base_cmd = (
+                f'"-DateTimeOriginal={date_str}" '
+                f'"-CreateDate={date_str}" '
+                f'"-ModifyDate={date_str}" '
+            )
+            cmd = f'exiftool -q -m -overwrite_original {base_cmd} "{filepath}"'
+        else:
+            # Use exiv2 for all images (including WebP)
             base_cmd = (
                 f'-M"set Exif.Image.DateTime {date_str}" '
                 f'-M"set Exif.Photo.DateTimeOriginal {date_str}" '
                 f'-M"set Exif.Photo.DateTimeDigitized {date_str}" '
             )
 
-            if is_whatsapp_img(filename):
+            has_tz = has_timezone(filepath)
+            if not has_tz:
                 base_cmd += f'-M"set Exif.Photo.OffsetTime {timezone_offset}" '
 
             cmd = f'exiv2 {base_cmd} "{filepath}"'
-
-        else:
-            base_cmd = (
-                f'"-DateTimeOriginal={date_str}" '
-                f'"-CreateDate={date_str}" '
-                f'"-ModifyDate={date_str}" '
-            )
-
-            if is_whatsapp_img(filename):
-                base_cmd += (
-                    f'"-OffsetTimeOriginal={timezone_offset}" '
-                    f'"-OffsetTimeDigitized={timezone_offset}" '
-                    f'"-OffsetTime={timezone_offset}" '
-                )
-
-            cmd = f'exiftool -q -m -overwrite_original {base_cmd} "{filepath}"'
 
         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
         logger.info(
             f"Processing file: {filepath} - Updated date to: {date_str} {timezone_offset if is_whatsapp_img(filename) else ''}"
         )
 
-        return "videos_modified" if filename.endswith(
-            (".mp4", ".3gp")
-        ) else "images_modified", filepath
+        return (
+            "videos_modified" if ext in VIDEO_EXTENSIONS else "images_modified",
+            filepath,
+        )
 
     except Exception as e:
         logger.warning(f"Error processing file {filename}: {str(e)}")
-        return "videos_error" if filename.endswith(
-            (".mp4", ".3gp")
-        ) else "images_error", None
+        return "videos_error" if ext in VIDEO_EXTENSIONS else "images_error", None
 
 
 def signal_handler(signum, frame):
@@ -369,9 +405,7 @@ def main(path, recursive, mod, force, dry_run, threads):
     relative_path = path
     logger.info("Listing files in target directory")
     filepaths = get_filepaths(path, recursive)
-    filepaths = filter_filepaths(
-        filepaths, allowed_ext={".mp4", ".jpg", ".3gp", ".jpeg"}
-    )
+    filepaths = filter_filepaths(filepaths, allowed_ext=SUPPORTED_EXTENSIONS)
     num_files = len(filepaths)
 
     num_threads = threads if threads else min(os.cpu_count() * 2, 8)
