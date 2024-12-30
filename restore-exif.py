@@ -422,12 +422,29 @@ def main(path, recursive, mod, force, dry_run, threads):
         time.sleep(5)
         num_files = len(files_to_refresh)
         progress_digits = len(str(num_files))
+        processed_count = 0
 
-        for i, filepath in enumerate(files_to_refresh):
-            logger.info(
-                f"{i + 1:>{progress_digits}}/{num_files} Refreshing asset metadata for file: {os.path.basename(filepath)}"
-            )
-            trigger_asset_refresh(filepath, relative_path)
+        # Utiliser ThreadPoolExecutor pour le rafraîchissement des métadonnées
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            future_to_file = {
+                executor.submit(
+                    trigger_asset_refresh, filepath, relative_path
+                ): filepath
+                for filepath in files_to_refresh
+            }
+
+            for future in as_completed(future_to_file):
+                filepath = future_to_file[future]
+                processed_count += 1
+                try:
+                    future.result()
+                    logger.info(
+                        f"{processed_count:>{progress_digits}}/{num_files} Refreshed asset metadata for file: {os.path.basename(filepath)}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error refreshing metadata for {os.path.basename(filepath)}: {str(e)}"
+                    )
 
     print("")
     logger.info("Processing summary:")
