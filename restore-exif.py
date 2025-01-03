@@ -47,7 +47,7 @@ def create_extensions_set(*extensions):
     return {ext if ext.startswith(".") else "." + ext for ext in extensions}
 
 
-PHOTO_EXTENSIONS = create_extensions_set("jpg", "jpeg", "png", "gif", "webp")
+PHOTO_EXTENSIONS = create_extensions_set("jpg", "jpeg", "png", "webp")
 VIDEO_EXTENSIONS = create_extensions_set(
     "mp4", "3gp", "mov", "avi", "mkv", "flv", "wmv", "webm"
 )
@@ -235,7 +235,7 @@ def repair_video(filepath):
             stderr=subprocess.DEVNULL,
         )
         os.replace(temp_file, filepath)
-        logger.info(f"\tVideo repaired successfully")
+        logger.info("\tVideo repaired successfully")
         return True
     except Exception as e:
         if os.path.exists(temp_file):
